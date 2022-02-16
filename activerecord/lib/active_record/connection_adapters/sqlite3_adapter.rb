@@ -193,7 +193,9 @@ module ActiveRecord
 
       # Returns the current database encoding format as a string, e.g. 'UTF-8'
       def encoding
-        @raw_connection.encoding.to_s
+        with_raw_connection(allow_retry: true, uses_transaction: false) do |conn|
+          conn.encoding.to_s
+        end
       end
 
       def supports_explain?

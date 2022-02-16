@@ -145,6 +145,10 @@ module ActiveRecord
         @config.fetch(:use_metadata_table, true)
       end
 
+      def connection_retries
+        (@config[:connection_retries] || 3).to_i
+      end
+
       def default_timezone
         @default_timezone || ActiveRecord.default_timezone
       end
@@ -238,6 +242,7 @@ module ActiveRecord
         end
 
         @owner = ActiveSupport::IsolatedExecutionState.context
+        @verified = nil
       end
 
       def connection_class # :nodoc:
@@ -276,6 +281,8 @@ module ActiveRecord
 
           @idle_since = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           @owner = nil
+          @raw_connection_dirty = false
+          @verified = nil
         else
           raise ActiveRecordError, "Cannot expire connection, it is not currently leased."
         end
@@ -288,6 +295,7 @@ module ActiveRecord
             pool.send :remove_connection_from_thread_cache, self, @owner
 
             @owner = ActiveSupport::IsolatedExecutionState.context
+            @verified = nil
           end
         else
           raise ActiveRecordError, "Cannot steal connection, it is not currently leased."
@@ -559,6 +567,8 @@ module ActiveRecord
       # holding @lock).
       def reconnect!(restore_transactions: false)
         reset_transaction(restore: restore_transactions) do
+          @raw_connection_dirty = false
+          @verified = true
           clear_cache!(new_connection: true)
           configure_connection
         end
@@ -629,7 +639,8 @@ module ActiveRecord
       # This is done under the hood by calling #active?. If the connection
       # is no longer active, then this method will reconnect to the database.
       def verify!
-        reconnect! unless active?
+        reconnect!(restore_transactions: true) unless active?
+        @verified = true
       end
 
       # Provides access to the underlying database driver for this adapter. For
@@ -639,9 +650,11 @@ module ActiveRecord
       # This is useful for when you need to call a proprietary method such as
       # PostgreSQL's lo_* methods.
       def raw_connection
-        disable_lazy_transactions!
-        @raw_connection_dirty = true
-        @raw_connection
+        with_raw_connection do |conn|
+          disable_lazy_transactions!
+          @raw_connection_dirty = true
+          conn
+        end
       end
 
       def default_uniqueness_comparison(attribute, value) # :nodoc:
@@ -797,6 +810,70 @@ module ActiveRecord
           transaction_manager.restorable? && !@raw_connection_dirty
         end
 
+        # Lock the monitor, ensure we're properly connected and
+        # transactions are materialized, and then yield the underlying
+        # raw connection object.
+        #
+        # If +allow_retry+ is true, a connection-related exception will
+        # cause an automatic reconnect and re-run of the block, up to
+        # the connection's configured +connection_retries+ setting.
+        #
+        # If +uses_transaction+ is false, the block will be run without
+        # ensuring virtual transactions have been materialized in the DB
+        # server's state. The active transaction will also remain clean
+        # (if it is not already dirty), meaning it's able to be restored
+        # by reconnecting and opening an equivalent-depth set of new
+        # transactions. This should only be used by transaction control
+        # methods, and internal transaction-agnostic queries.
+        #
+        ###
+        #
+        # It's not the primary use case, so not something to optimize
+        # for, but note that this method does need to be re-entrant:
+        # +materialize_transactions+ will re-enter if it has work to do,
+        # and the yield block can also do so under some circumstances.
+        #
+        # In the latter case, we really ought to guarantee the inner
+        # call will not reconnect (which would interfere with the
+        # still-yielded connection in the outer block), but we currently
+        # provide no special enforcement there.
+        #
+        def with_raw_connection(allow_retry: false, uses_transaction: true)
+          @lock.synchronize do
+            materialize_transactions if uses_transaction
+
+            retries_available = 0
+
+            if reconnect_can_restore_state?
+              if allow_retry
+                retries_available = connection_retries
+              elsif !@verified
+                verify!
+              end
+            end
+
+            begin
+              result = yield @raw_connection
+              @verified = true
+              result
+            rescue => ex
+              if retries_available > 0 && retryable_error?(ex) && reconnect_can_restore_state?
+                retries_available -= 1
+                reconnect!(restore_transactions: true)
+                retry
+              end
+
+              raise
+            ensure
+              dirty_current_transaction if uses_transaction
+            end
+          end
+        end
+
+        def retryable_error?(ex)
+          false
+        end
+
         def extended_type_map_key
           if @default_timezone
             { default_timezone: @default_timezone }
@@ -823,7 +900,7 @@ module ActiveRecord
           exception
         end
 
-        def log(sql, name = "SQL", binds = [], type_casted_binds = [], statement_name = nil, async: false, &block) # :doc:
+        def log(sql, name = "SQL", binds = [], type_casted_binds = [], statement_name = nil, async: false) # :doc:
           @instrumenter.instrument(
             "sql.active_record",
             sql:               sql,
@@ -833,7 +910,7 @@ module ActiveRecord
             statement_name:    statement_name,
             async:             async,
             connection:        self) do
-            @lock.synchronize(&block)
+            yield
           rescue => e
             raise translate_exception_class(e, sql, binds)
           end
@@ -849,7 +926,7 @@ module ActiveRecord
         def translate_exception(exception, message:, sql:, binds:)
           # override in derived class
           case exception
-          when RuntimeError
+          when RuntimeError, ActiveRecord::ActiveRecordError
             exception
           else
             ActiveRecord::StatementInvalid.new(message, sql: sql, binds: binds)

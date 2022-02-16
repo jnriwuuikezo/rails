@@ -506,7 +506,9 @@ module ActiveRecord
 
       # Returns the version of the connected PostgreSQL server.
       def get_database_version # :nodoc:
-        @raw_connection.server_version
+        with_raw_connection(allow_retry: true, uses_transaction: false) do |conn|
+          conn.server_version
+        end
       end
       alias :postgresql_version :database_version
 
@@ -767,8 +769,8 @@ module ActiveRecord
 
           type_casted_binds = type_casted_binds(binds)
           log(sql, name, binds, type_casted_binds, async: async) do
-            ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
-              @raw_connection.exec_params(sql, type_casted_binds)
+            with_raw_connection do |conn|
+              conn.exec_params(sql, type_casted_binds)
             end
           end
         end
@@ -781,8 +783,8 @@ module ActiveRecord
           type_casted_binds = type_casted_binds(binds)
 
           log(sql, name, binds, type_casted_binds, stmt_key, async: async) do
-            ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
-              @raw_connection.exec_prepared(stmt_key, type_casted_binds)
+            with_raw_connection do |conn|
+              conn.exec_prepared(stmt_key, type_casted_binds)
             end
           end
         rescue ActiveRecord::StatementInvalid => e
@@ -831,17 +833,17 @@ module ActiveRecord
         # Prepare the statement if it hasn't been prepared, return
         # the statement key.
         def prepare_statement(sql, binds)
-          @lock.synchronize do
+          with_raw_connection(allow_retry: true, uses_transaction: false) do |conn|
             sql_key = sql_key(sql)
             unless @statements.key? sql_key
               nextkey = @statements.next_key
               begin
-                @raw_connection.prepare nextkey, sql
+                conn.prepare nextkey, sql
               rescue => e
                 raise translate_exception_class(e, sql, binds)
               end
               # Clear the queue
-              @raw_connection.get_last_result
+              conn.get_last_result
               @statements[sql_key] = nextkey
             end
             @statements[sql_key]
